@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/detectors"
@@ -19,20 +22,22 @@ import (
 // for poorly defined regexps.
 const maxTotalMatches = 100
 
-// customRegexWebhook is a CustomRegex with webhook validation that is
+// CustomRegexWebhook is a CustomRegex with webhook validation that is
 // guaranteed to be valid (assuming the data is not changed after
 // initialization).
-type customRegexWebhook struct {
+type CustomRegexWebhook struct {
 	*custom_detectorspb.CustomRegex
 }
 
 // Ensure the Scanner satisfies the interface at compile time.
-var _ detectors.Detector = (*customRegexWebhook)(nil)
+var _ detectors.Detector = (*CustomRegexWebhook)(nil)
+var _ detectors.CustomFalsePositiveChecker = (*CustomRegexWebhook)(nil)
+var _ detectors.MaxSecretSizeProvider = (*CustomRegexWebhook)(nil)
 
-// NewWebhookCustomRegex initializes and validates a customRegexWebhook. An
+// NewWebhookCustomRegex initializes and validates a CustomRegexWebhook. An
 // unexported type is intentionally returned here to ensure the values have
 // been validated.
-func NewWebhookCustomRegex(pb *custom_detectorspb.CustomRegex) (*customRegexWebhook, error) {
+func NewWebhookCustomRegex(pb *custom_detectorspb.CustomRegex) (*CustomRegexWebhook, error) {
 	// TODO: Return all validation errors.
 	if err := ValidateKeywords(pb.Keywords); err != nil {
 		return nil, err
@@ -51,12 +56,12 @@ func NewWebhookCustomRegex(pb *custom_detectorspb.CustomRegex) (*customRegexWebh
 	}
 
 	// TODO: Copy only necessary data out of pb.
-	return &customRegexWebhook{pb}, nil
+	return &CustomRegexWebhook{pb}, nil
 }
 
 var httpClient = common.SaneHttpClient()
 
-func (c *customRegexWebhook) FromData(ctx context.Context, verify bool, data []byte) (results []detectors.Result, err error) {
+func (c *CustomRegexWebhook) FromData(ctx context.Context, verify bool, data []byte) (results []detectors.Result, err error) {
 	dataStr := string(data)
 	regexMatches := make(map[string][][]string, len(c.GetRegex()))
 
@@ -82,69 +87,133 @@ func (c *customRegexWebhook) FromData(ctx context.Context, verify bool, data []b
 	// ]
 	matches := permutateMatches(regexMatches)
 
+	g := new(errgroup.Group)
+
 	// Create result object and test for verification.
+	resultsCh := make(chan detectors.Result, maxTotalMatches)
 	for _, match := range matches {
-		if common.IsDone(ctx) {
-			// TODO: Log we're possibly leaving out results.
-			return results, nil
-		}
-		var raw string
-		for _, values := range match {
-			// values[0] contains the entire regex match.
-			raw += values[0]
-		}
-		result := detectors.Result{
-			DetectorType: detectorspb.DetectorType_CustomRegex,
-			Raw:          []byte(raw),
+		g.Go(func() error {
+			return c.createResults(ctx, match, verify, resultsCh)
+		})
+	}
+
+	// Ignore any errors and collect as many of the results as we can.
+	_ = g.Wait()
+	close(resultsCh)
+
+	for result := range resultsCh {
+		if result.ExtraData != nil {
+			result.ExtraData["name"] = c.GetName()
 		}
 
-		if !verify {
-			results = append(results, result)
-			continue
-		}
-		// Verify via webhook.
-		jsonBody, err := json.Marshal(map[string]map[string][]string{
-			c.GetName(): match,
-		})
-		if err != nil {
-			continue
-		}
-		// Try each config until we successfully verify.
-		for _, verifyConfig := range c.GetVerify() {
-			if common.IsDone(ctx) {
-				// TODO: Log we're possibly leaving out results.
-				return results, nil
-			}
-			req, err := http.NewRequestWithContext(ctx, "POST", verifyConfig.GetEndpoint(), bytes.NewReader(jsonBody))
-			if err != nil {
-				continue
-			}
-			for _, header := range verifyConfig.GetHeaders() {
-				key, value, found := strings.Cut(header, ":")
-				if !found {
-					// Should be unreachable due to validation.
-					continue
-				}
-				req.Header.Add(key, strings.TrimLeft(value, "\t\n\v\f\r "))
-			}
-			res, err := httpClient.Do(req)
-			if err != nil {
-				continue
-			}
-			// TODO: Read response body.
-			res.Body.Close()
-			if res.StatusCode == http.StatusOK {
-				result.Verified = true
-				break
-			}
-		}
 		results = append(results, result)
 	}
 
 	return results, nil
 }
 
-func (c *customRegexWebhook) Keywords() []string {
+func (c *CustomRegexWebhook) IsFalsePositive(_ detectors.Result) (bool, string) {
+	return false, ""
+}
+
+// custom max size for custom detector
+func (c *CustomRegexWebhook) MaxSecretSize() int64 {
+	return 1000
+}
+
+func (c *CustomRegexWebhook) createResults(ctx context.Context, match map[string][]string, verify bool, results chan<- detectors.Result) error {
+	if common.IsDone(ctx) {
+		// TODO: Log we're possibly leaving out results.
+		return ctx.Err()
+	}
+	var raw string
+	for _, values := range match {
+		// values[0] contains the entire regex match.
+		raw += values[0]
+	}
+	result := detectors.Result{
+		DetectorType: detectorspb.DetectorType_CustomRegex,
+		DetectorName: c.GetName(),
+		Raw:          []byte(raw),
+		ExtraData:    map[string]string{},
+	}
+
+	if !verify {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case results <- result:
+			return nil
+		}
+	}
+	// Verify via webhook.
+	jsonBody, err := json.Marshal(map[string]map[string][]string{
+		c.GetName(): match,
+	})
+	if err != nil {
+		// This should never happen, but if it does, return nil to not
+		// disrupt other verification.
+		return nil
+	}
+	// Try each config until we successfully verify.
+	for _, verifyConfig := range c.GetVerify() {
+		if common.IsDone(ctx) {
+			// TODO: Log we're possibly leaving out results.
+			return ctx.Err()
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", verifyConfig.GetEndpoint(), bytes.NewReader(jsonBody))
+		if err != nil {
+			continue
+		}
+		for _, header := range verifyConfig.GetHeaders() {
+			key, value, found := strings.Cut(header, ":")
+			if !found {
+				// Should be unreachable due to validation.
+				continue
+			}
+			req.Header.Add(key, strings.TrimLeft(value, "\t\n\v\f\r "))
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			continue
+		}
+		defer func() {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}()
+
+		if resp.StatusCode == http.StatusOK {
+			// mark the result as verified
+			result.Verified = true
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				continue
+			}
+
+			// TODO: handle different content-type responses seperatly when implement custom detector configurations
+			responseStr := string(body)
+			// truncate to 200 characters if response length exceeds 200
+			if len(responseStr) > 200 {
+				responseStr = responseStr[:200]
+			}
+
+			// store the processed response in ExtraData
+			result.ExtraData["response"] = responseStr
+
+			break
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case results <- result:
+		return nil
+	}
+}
+
+func (c *CustomRegexWebhook) Keywords() []string {
 	return c.GetKeywords()
 }
 
@@ -209,6 +278,15 @@ func permutateMatches(regexMatches map[string][][]string) []map[string][]string 
 	return matches
 }
 
-func (c *customRegexWebhook) Type() detectorspb.DetectorType {
+func (c *CustomRegexWebhook) Type() detectorspb.DetectorType {
 	return detectorspb.DetectorType_CustomRegex
+}
+
+const defaultDescription = "This is a user-defined detector with no description provided."
+
+func (c *CustomRegexWebhook) Description() string {
+	if c.GetDescription() == "" {
+		return defaultDescription
+	}
+	return c.GetDescription()
 }

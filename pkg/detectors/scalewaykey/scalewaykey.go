@@ -2,9 +2,8 @@ package scalewaykey
 
 import (
 	"context"
-	"fmt"
+	regexp "github.com/wasilibs/go-re2"
 	"net/http"
-	"regexp"
 	"strings"
 
 	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
@@ -51,17 +50,12 @@ func (s Scanner) FromData(ctx context.Context, verify bool, data []byte) (result
 			if err != nil {
 				continue
 			}
-			req.Header.Add("X-Auth-Token", fmt.Sprintf("%s", resMatch))
+			req.Header.Add("X-Auth-Token", resMatch)
 			res, err := client.Do(req)
 			if err == nil {
 				defer res.Body.Close()
 				if res.StatusCode >= 200 && res.StatusCode < 300 {
 					s1.Verified = true
-				} else {
-
-					if detectors.IsKnownFalsePositive(resMatch, detectors.DefaultFalsePositives, false) {
-						continue
-					}
 				}
 			}
 		}
@@ -74,4 +68,8 @@ func (s Scanner) FromData(ctx context.Context, verify bool, data []byte) (result
 
 func (s Scanner) Type() detectorspb.DetectorType {
 	return detectorspb.DetectorType_ScalewayKey
+}
+
+func (s Scanner) Description() string {
+	return "Scaleway is a cloud service provider offering various services including virtual instances, storage, and networking. Scaleway API keys can be used to access and manage these services."
 }

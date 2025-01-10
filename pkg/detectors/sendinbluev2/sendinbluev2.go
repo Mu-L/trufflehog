@@ -2,9 +2,8 @@ package sendinbluev2
 
 import (
 	"context"
-	"fmt"
+	regexp "github.com/wasilibs/go-re2"
 	"net/http"
-	"regexp"
 	"strings"
 
 	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
@@ -51,16 +50,12 @@ func (s Scanner) FromData(ctx context.Context, verify bool, data []byte) (result
 			if err != nil {
 				continue
 			}
-			req.Header.Add("api-key", fmt.Sprintf("%s", resMatch))
+			req.Header.Add("api-key", resMatch)
 			res, err := client.Do(req)
 			if err == nil {
 				defer res.Body.Close()
 				if res.StatusCode >= 200 && res.StatusCode < 300 {
 					s1.Verified = true
-				} else {
-					if detectors.IsKnownFalsePositive(resMatch, detectors.DefaultFalsePositives, false) {
-						continue
-					}
 				}
 			}
 		}
@@ -73,4 +68,8 @@ func (s Scanner) FromData(ctx context.Context, verify bool, data []byte) (result
 
 func (s Scanner) Type() detectorspb.DetectorType {
 	return detectorspb.DetectorType_SendinBlueV2
+}
+
+func (s Scanner) Description() string {
+	return "SendinBlue is a cloud-based marketing communication software. SendinBlue API keys can be used to access and modify marketing campaigns and contact data."
 }
