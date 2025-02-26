@@ -16,7 +16,7 @@ import (
 )
 
 func TestSource_Scan(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
 	secret, err := common.GetTestSecret(ctx)
@@ -50,12 +50,10 @@ func TestSource_Scan(t *testing.T) {
 			wantSourceMetadata: &source_metadatapb.MetaData{
 				Data: &source_metadatapb.MetaData_Circleci{
 					Circleci: &source_metadatapb.CircleCI{
-						VcsType:     "github",
-						Username:    "dustin-decker",
-						Repository:  "circle-ci",
-						BuildNumber: 2,
-						BuildStep:   "Spin up environment",
-						Link:        "https://app.circleci.com/pipelines/github/dustin-decker/circle-ci/2",
+						VcsType:    "github",
+						Username:   "dustin-decker",
+						Repository: "circle-ci",
+						BuildStep:  "Spin up environment",
 					},
 				},
 			},
@@ -84,9 +82,16 @@ func TestSource_Scan(t *testing.T) {
 					return
 				}
 			}()
-			gotChunk := <-chunksCh
-			if diff := pretty.Compare(gotChunk.SourceMetadata, tt.wantSourceMetadata); diff != "" {
-				t.Errorf("Source.Chunks() %s diff: (-got +want)\n%s", tt.name, diff)
+
+			select {
+			case gotChunk := <-chunksCh:
+				gotChunk.SourceMetadata.Data.(*source_metadatapb.MetaData_Circleci).Circleci.BuildNumber = 0 // override this because we need to periodically re-run the builds
+				gotChunk.SourceMetadata.Data.(*source_metadatapb.MetaData_Circleci).Circleci.Link = ""       // override this because we need to periodically re-run the builds
+				if diff := pretty.Compare(gotChunk.SourceMetadata, tt.wantSourceMetadata); diff != "" {
+					t.Errorf("Source.Chunks() %s diff: (-got +want)\n%s", tt.name, diff)
+				}
+			case <-ctx.Done():
+				t.Errorf("Source.Chunks() %s timed out", tt.name)
 			}
 		})
 	}
